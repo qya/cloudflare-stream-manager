@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Play, Download, Trash2, Eye, Clock, CheckCircle, AlertCircle, ExternalLink, X, Calendar, FileText, Monitor, Zap } from 'lucide-react';
+import { Play, Download, Trash2, Eye, Clock, CheckCircle, AlertCircle, ExternalLink, X, Calendar, FileText, Monitor, Zap, Square, CheckSquare, Package } from 'lucide-react';
 import { Video } from '../../types';
 import { TusUploadService } from '../../services/tusUpload';
 import CloudflareStreamService from '../../services/cloudflare';
@@ -22,6 +22,30 @@ const VideoList: React.FC<VideoListProps> = ({ cloudflareService, refreshTrigger
     message: string;
     downloadUrl?: string;
   }>({ status: 'enabling', percentComplete: 0, message: 'Preparing download...' });
+
+  // Bulk download state
+  const [selectedVideos, setSelectedVideos] = useState<Set<string>>(new Set());
+  const [bulkDownloadActive, setBulkDownloadActive] = useState(false);
+  const [bulkDownloadProgress, setBulkDownloadProgress] = useState<{
+    [videoId: string]: {
+      status: 'pending' | 'enabling' | 'inprogress' | 'ready' | 'error' | 'downloaded';
+      percentComplete: number;
+      message: string;
+      downloadUrl?: string;
+      error?: string;
+    };
+  }>({});
+
+  // Bulk delete state
+  const [bulkDeleteActive, setBulkDeleteActive] = useState(false);
+  const [bulkDeleteProgress, setBulkDeleteProgress] = useState<{
+    [videoId: string]: {
+      status: 'pending' | 'deleting' | 'deleted' | 'error';
+      message: string;
+      error?: string;
+    };
+  }>({});
+  const [showDeleteConfirmation, setShowDeleteConfirmation] = useState(false);
 
   const fetchVideos = async () => {
     try {
@@ -167,6 +191,277 @@ const VideoList: React.FC<VideoListProps> = ({ cloudflareService, refreshTrigger
     }
   };
 
+  // Bulk download functions
+  const handleSelectVideo = (videoId: string) => {
+    const newSelected = new Set(selectedVideos);
+    if (newSelected.has(videoId)) {
+      newSelected.delete(videoId);
+    } else {
+      newSelected.add(videoId);
+    }
+    setSelectedVideos(newSelected);
+  };
+
+  const handleSelectAll = () => {
+    const readyVideos = videos.filter(video => video.status.state === 'ready');
+    if (selectedVideos.size === readyVideos.length) {
+      setSelectedVideos(new Set());
+    } else {
+      setSelectedVideos(new Set(readyVideos.map(video => video.uid)));
+    }
+  };
+
+  const handleBulkDownload = async () => {
+    if (selectedVideos.size === 0) return;
+
+    setBulkDownloadActive(true);
+    
+    // Initialize progress for all selected videos
+    const initialProgress: typeof bulkDownloadProgress = {};
+    selectedVideos.forEach(videoId => {
+      initialProgress[videoId] = {
+        status: 'pending',
+        percentComplete: 0,
+        message: 'Queued for download...'
+      };
+    });
+    setBulkDownloadProgress(initialProgress);
+
+    // Process downloads sequentially to avoid overwhelming the API
+    for (const videoId of Array.from(selectedVideos)) {
+      try {
+        const video = videos.find(v => v.uid === videoId);
+        if (!video) continue;
+
+        // Update status to enabling
+        setBulkDownloadProgress(prev => ({
+          ...prev,
+          [videoId]: {
+            ...prev[videoId],
+            status: 'enabling',
+            message: 'Preparing download...'
+          }
+        }));
+
+        // Generate clean filename
+        const videoName = video.meta?.name || video.filename || 'video';
+        const cleanFilename = videoName.replace(/[^a-zA-Z0-9\-_\s]/g, '').replace(/\s+/g, '_');
+
+        // Check if download is already enabled
+        let downloadInfo = await cloudflareService.getVideoDownloadStatus(videoId);
+        
+        // If not enabled, enable it
+        if (!downloadInfo) {
+          downloadInfo = await cloudflareService.enableVideoDownload(videoId);
+        }
+
+        // Handle different statuses
+        if (downloadInfo.status === 'inprogress') {
+          setBulkDownloadProgress(prev => ({
+            ...prev,
+            [videoId]: {
+              ...prev[videoId],
+              status: 'inprogress',
+              percentComplete: downloadInfo.percentComplete,
+              message: `Processing... ${downloadInfo.percentComplete}%`
+            }
+          }));
+
+          // Poll for progress
+          const pollForProgress = async () => {
+            try {
+              const updatedInfo = await cloudflareService.getVideoDownloadStatus(videoId);
+              if (updatedInfo) {
+                setBulkDownloadProgress(prev => ({
+                  ...prev,
+                  [videoId]: {
+                    ...prev[videoId],
+                    status: updatedInfo.status === 'ready' ? 'ready' : 'inprogress',
+                    percentComplete: updatedInfo.percentComplete,
+                    message: updatedInfo.status === 'ready' ? 'Ready to download' : `Processing... ${updatedInfo.percentComplete}%`,
+                    downloadUrl: updatedInfo.status === 'ready' ? updatedInfo.url + (cleanFilename ? `?filename=${cleanFilename}` : '') : undefined
+                  }
+                }));
+
+                if (updatedInfo.status === 'ready') {
+                  return;
+                } else if (updatedInfo.status === 'error') {
+                  setBulkDownloadProgress(prev => ({
+                    ...prev,
+                    [videoId]: {
+                      ...prev[videoId],
+                      status: 'error',
+                      message: 'Processing failed',
+                      error: 'Download processing failed'
+                    }
+                  }));
+                  return;
+                } else {
+                  // Continue polling
+                  setTimeout(pollForProgress, 2000);
+                }
+              }
+            } catch (error) {
+              setBulkDownloadProgress(prev => ({
+                ...prev,
+                [videoId]: {
+                  ...prev[videoId],
+                  status: 'error',
+                  message: 'Failed to check progress',
+                  error: error instanceof Error ? error.message : 'Unknown error'
+                }
+              }));
+            }
+          };
+
+          setTimeout(pollForProgress, 2000);
+
+        } else if (downloadInfo.status === 'ready') {
+          const downloadUrl = downloadInfo.url + (cleanFilename ? `?filename=${cleanFilename}` : '');
+          setBulkDownloadProgress(prev => ({
+            ...prev,
+            [videoId]: {
+              ...prev[videoId],
+              status: 'ready',
+              percentComplete: 100,
+              message: 'Ready to download',
+              downloadUrl: downloadUrl
+            }
+          }));
+        } else if (downloadInfo.status === 'error') {
+          setBulkDownloadProgress(prev => ({
+            ...prev,
+            [videoId]: {
+              ...prev[videoId],
+              status: 'error',
+              message: 'Processing failed',
+              error: 'Download processing failed'
+            }
+          }));
+        }
+
+      } catch (error) {
+        console.error(`Download preparation failed for video ${videoId}:`, error);
+        setBulkDownloadProgress(prev => ({
+          ...prev,
+          [videoId]: {
+            ...prev[videoId],
+            status: 'error',
+            message: 'Failed to prepare download',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          }
+        }));
+      }
+
+      // Small delay between requests to avoid rate limiting
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+  };
+
+  const handleDownloadAll = () => {
+    Object.entries(bulkDownloadProgress).forEach(([videoId, progress]) => {
+      if (progress.status === 'ready' && progress.downloadUrl) {
+        const video = videos.find(v => v.uid === videoId);
+        const videoName = video?.meta?.name || video?.filename || 'video';
+        const cleanFilename = videoName.replace(/[^a-zA-Z0-9\-_\s]/g, '').replace(/\s+/g, '_');
+        
+        const link = document.createElement('a');
+        link.href = progress.downloadUrl;
+        link.download = cleanFilename + '.mp4';
+        link.target = '_blank';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+
+        // Mark as downloaded
+        setBulkDownloadProgress(prev => ({
+          ...prev,
+          [videoId]: {
+            ...prev[videoId],
+            status: 'downloaded',
+            message: 'Downloaded'
+          }
+        }));
+      }
+    });
+  };
+
+  const closeBulkDownload = () => {
+    setBulkDownloadActive(false);
+    setBulkDownloadProgress({});
+    setSelectedVideos(new Set());
+  };
+
+  // Bulk delete functions
+  const handleBulkDeleteConfirm = async () => {
+    if (selectedVideos.size === 0) return;
+
+    setShowDeleteConfirmation(false);
+    setBulkDeleteActive(true);
+    
+    // Initialize progress for all selected videos
+    const initialProgress: typeof bulkDeleteProgress = {};
+    selectedVideos.forEach(videoId => {
+      initialProgress[videoId] = {
+        status: 'pending',
+        message: 'Queued for deletion...'
+      };
+    });
+    setBulkDeleteProgress(initialProgress);
+
+    // Process deletions sequentially
+    for (const videoId of Array.from(selectedVideos)) {
+      try {
+        // Update status to deleting
+        setBulkDeleteProgress(prev => ({
+          ...prev,
+          [videoId]: {
+            ...prev[videoId],
+            status: 'deleting',
+            message: 'Deleting video...'
+          }
+        }));
+
+        // Delete the video
+        await cloudflareService.deleteVideo(videoId);
+        
+        // Update status to deleted
+        setBulkDeleteProgress(prev => ({
+          ...prev,
+          [videoId]: {
+            ...prev[videoId],
+            status: 'deleted',
+            message: 'Successfully deleted'
+          }
+        }));
+
+        // Remove from videos list
+        setVideos(prev => prev.filter(video => video.uid !== videoId));
+
+      } catch (error) {
+        console.error(`Delete failed for video ${videoId}:`, error);
+        setBulkDeleteProgress(prev => ({
+          ...prev,
+          [videoId]: {
+            ...prev[videoId],
+            status: 'error',
+            message: 'Failed to delete',
+            error: error instanceof Error ? error.message : 'Unknown error'
+          }
+        }));
+      }
+
+      // Small delay between requests to avoid rate limiting
+      await new Promise(resolve => setTimeout(resolve, 300));
+    }
+  };
+
+  const closeBulkDelete = () => {
+    setBulkDeleteActive(false);
+    setBulkDeleteProgress({});
+    setSelectedVideos(new Set());
+  };
+
   const handleOpenInBrowser = (video: Video) => {
     const url = video.preview;
     if (url) {
@@ -299,8 +594,55 @@ const VideoList: React.FC<VideoListProps> = ({ cloudflareService, refreshTrigger
     <>
       <div className="bg-white rounded-xl shadow-sm border border-gray-200">
         <div className="p-6 border-b border-gray-200">
-          <h3 className="text-lg font-semibold text-gray-900">Your Videos</h3>
-          <p className="text-sm text-gray-500 mt-1">{videos.length} videos total</p>
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="text-lg font-semibold text-gray-900">Your Videos</h3>
+              <p className="text-sm text-gray-500 mt-1">{videos.length} videos total</p>
+            </div>
+            
+            {/* Bulk Actions */}
+            <div className="flex items-center space-x-3">
+              {videos.filter(video => video.status.state === 'ready').length > 0 && (
+                <>
+                  <button
+                    onClick={handleSelectAll}
+                    className="flex items-center space-x-2 px-3 py-2 text-sm text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors"
+                  >
+                    {selectedVideos.size === videos.filter(video => video.status.state === 'ready').length ? (
+                      <CheckSquare className="w-4 h-4" />
+                    ) : (
+                      <Square className="w-4 h-4" />
+                    )}
+                    <span>
+                      {selectedVideos.size === videos.filter(video => video.status.state === 'ready').length 
+                        ? 'Deselect All' 
+                        : 'Select All'}
+                    </span>
+                  </button>
+                  
+                  {selectedVideos.size > 0 && (
+                    <>
+                      <button
+                        onClick={handleBulkDownload}
+                        className="flex items-center space-x-2 px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors"
+                      >
+                        <Package className="w-4 h-4" />
+                        <span>Download {selectedVideos.size} Video{selectedVideos.size > 1 ? 's' : ''}</span>
+                      </button>
+                      
+                      <button
+                        onClick={() => setShowDeleteConfirmation(true)}
+                        className="flex items-center space-x-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                        <span>Delete {selectedVideos.size} Video{selectedVideos.size > 1 ? 's' : ''}</span>
+                      </button>
+                    </>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
         </div>
         
         <div className="divide-y divide-gray-200">
@@ -315,6 +657,19 @@ const VideoList: React.FC<VideoListProps> = ({ cloudflareService, refreshTrigger
             <div key={video.uid} className="p-6 hover:bg-gray-50 transition-colors">
               <div className="flex items-center justify-between">
                 <div className="flex items-center space-x-4 flex-1">
+                  {/* Selection Checkbox */}
+                  {video.status.state === 'ready' && (
+                    <button
+                      onClick={() => handleSelectVideo(video.uid)}
+                      className="p-1 text-gray-400 hover:text-gray-600 transition-colors"
+                    >
+                      {selectedVideos.has(video.uid) ? (
+                        <CheckSquare className="w-5 h-5 text-purple-600" />
+                      ) : (
+                        <Square className="w-5 h-5" />
+                      )}
+                    </button>
+                  )}
                   <div 
                     className="relative w-16 h-12 bg-gray-200 rounded-lg flex items-center justify-center cursor-pointer group hover:ring-2 hover:ring-blue-500 transition-all"
                     onClick={() => video.status.state === 'ready' && handlePreviewVideo(video)}
@@ -322,7 +677,7 @@ const VideoList: React.FC<VideoListProps> = ({ cloudflareService, refreshTrigger
                     {video.thumbnail ? (
                       <>
                         <img
-                          src={video.thumbnail}
+                          src={video.thumbnail || 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJsdWNpZGUtdmlkZW8iPjxwYXRoIGQ9Im0yMiAyLTcgNXY5bDcgNVYyWiIvPjxyZWN0IHdpZHRoPSIxNSIgaGVpZ2h0PSIxNSIgeD0iMSIgeT0iNCIgcng9IjIiIHJ5PSIyIi8+PC9zdmc+'}
                           alt={video.filename}
                           className="w-full h-full object-cover rounded-lg"
                         />
@@ -338,7 +693,7 @@ const VideoList: React.FC<VideoListProps> = ({ cloudflareService, refreshTrigger
                   </div>
                   
                   <div className="flex-1 min-w-0">
-                    <h4 className="font-medium text-gray-900 truncate">
+                    <h4 className="font-medium text-gray-900 truncate overflow-hidden text-ellipsis whitespace-nowrap w-full max-w-xs sm:max-w-sm md:max-w-md lg:max-w-lg">
                       {video.meta?.name || video.filename || 'Untitled Video'}
                     </h4>
                     <div className="flex items-center space-x-4 mt-1 text-sm text-gray-500">
@@ -536,17 +891,23 @@ const VideoList: React.FC<VideoListProps> = ({ cloudflareService, refreshTrigger
                         {previewVideo.playback.hls && (
                           <div>
                             <span className="text-gray-500 block mb-1">HLS:</span>
-                            <span className="text-xs text-gray-900 break-all bg-white p-2 rounded border font-mono">
-                              {previewVideo.playback.hls}
-                            </span>
+                            <textarea 
+                              readOnly
+                              value={previewVideo.playback.hls}
+                              className="text-xs text-gray-900 break-all bg-white p-2 rounded border font-mono w-full resize-none"
+                              rows={2}
+                            />
                           </div>
                         )}
                         {previewVideo.playback.dash && (
                           <div>
                             <span className="text-gray-500 block mb-1">DASH:</span>
-                            <span className="text-xs text-gray-900 break-all bg-white p-2 rounded border font-mono">
-                              {previewVideo.playback.dash}
-                            </span>
+                            <textarea
+                              readOnly
+                              value={previewVideo.playback.dash}
+                              className="text-xs text-gray-900 break-all bg-white p-2 rounded border font-mono w-full resize-none"
+                              rows={2}
+                            />
                           </div>
                         )}
                       </div>
@@ -606,9 +967,9 @@ const VideoList: React.FC<VideoListProps> = ({ cloudflareService, refreshTrigger
                         </span>
                       </div>
                       {previewVideo.watermark && (
-                        <div className="flex justify-between">
+                        <div className="flex flex-col sm:flex-row sm:justify-between gap-1 sm:gap-2">
                           <span className="text-gray-500">Watermark:</span>
-                          <span className="text-gray-900 font-mono text-xs">
+                          <span className="text-gray-900 font-mono text-xs break-all">
                             {previewVideo.watermark.uid}
                           </span>
                         </div>
@@ -814,6 +1175,369 @@ const VideoList: React.FC<VideoListProps> = ({ cloudflareService, refreshTrigger
                     <div className="flex-1 text-center text-sm text-gray-500">
                       Please wait while we prepare your download...
                     </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bulk Download Modal */}
+      {bulkDownloadActive && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-hidden">
+            {/* Modal Header */}
+            <div className="flex items-center justify-between p-6 border-b border-gray-200">
+              <div className="flex items-center space-x-3">
+                <div className="w-10 h-10 bg-purple-100 rounded-lg flex items-center justify-center">
+                  <Package className="w-5 h-5 text-purple-600" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-semibold text-gray-900">Bulk Download</h3>
+                  <p className="text-sm text-gray-500">
+                    Processing {Object.keys(bulkDownloadProgress).length} videos
+                  </p>
+                </div>
+              </div>
+              
+              {/* Progress Summary */}
+              <div className="text-right">
+                <div className="text-sm font-medium text-gray-900">
+                  {Object.values(bulkDownloadProgress).filter(p => p.status === 'ready').length} / {Object.keys(bulkDownloadProgress).length} Ready
+                </div>
+                <div className="text-xs text-gray-500">
+                  {Object.values(bulkDownloadProgress).filter(p => p.status === 'downloaded').length} Downloaded
+                </div>
+              </div>
+            </div>
+
+            {/* Modal Content */}
+            <div className="p-6 max-h-96 overflow-y-auto">
+              <div className="space-y-4">
+                {Object.entries(bulkDownloadProgress).map(([videoId, progress]) => {
+                  const video = videos.find(v => v.uid === videoId);
+                  const videoName = video?.meta?.name || video?.filename || 'Untitled Video';
+                  
+                  return (
+                    <div key={videoId} className="border border-gray-200 rounded-lg p-4">
+                      <div className="flex items-center justify-between mb-2">
+                        <h4 className="font-medium text-gray-900 truncate flex-1 mr-4">
+                          {videoName}
+                        </h4>
+                        <div className="flex items-center space-x-2">
+                          {progress.status === 'pending' && (
+                            <Clock className="w-4 h-4 text-gray-400" />
+                          )}
+                          {(progress.status === 'enabling' || progress.status === 'inprogress') && (
+                            <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+                          )}
+                          {progress.status === 'ready' && (
+                            <CheckCircle className="w-4 h-4 text-green-500" />
+                          )}
+                          {progress.status === 'downloaded' && (
+                            <CheckCircle className="w-4 h-4 text-blue-500" />
+                          )}
+                          {progress.status === 'error' && (
+                            <AlertCircle className="w-4 h-4 text-red-500" />
+                          )}
+                        </div>
+                      </div>
+                      
+                      {/* Progress Bar */}
+                      <div className="mb-2">
+                        <div className="w-full bg-gray-200 rounded-full h-2">
+                          <div 
+                            className={`h-2 rounded-full transition-all duration-300 ${
+                              progress.status === 'error' 
+                                ? 'bg-red-500' 
+                                : progress.status === 'ready' || progress.status === 'downloaded'
+                                ? 'bg-green-500'
+                                : 'bg-blue-500'
+                            }`}
+                            style={{ width: `${progress.percentComplete}%` }}
+                          />
+                        </div>
+                      </div>
+                      
+                      {/* Status Message */}
+                      <div className="flex items-center justify-between">
+                        <p className={`text-sm ${
+                          progress.status === 'error' ? 'text-red-600' : 'text-gray-600'
+                        }`}>
+                          {progress.message}
+                        </p>
+                        
+                        {/* Individual Download Button */}
+                        {progress.status === 'ready' && progress.downloadUrl && (
+                          <button
+                            onClick={() => {
+                              const cleanFilename = videoName.replace(/[^a-zA-Z0-9\-_\s]/g, '').replace(/\s+/g, '_');
+                              const link = document.createElement('a');
+                              link.href = progress.downloadUrl!;
+                              link.download = cleanFilename + '.mp4';
+                              link.target = '_blank';
+                              document.body.appendChild(link);
+                              link.click();
+                              document.body.removeChild(link);
+
+                              setBulkDownloadProgress(prev => ({
+                                ...prev,
+                                [videoId]: {
+                                  ...prev[videoId],
+                                  status: 'downloaded',
+                                  message: 'Downloaded'
+                                }
+                              }));
+                            }}
+                            className="flex items-center space-x-1 px-3 py-1 bg-green-600 text-white text-sm rounded hover:bg-green-700 transition-colors"
+                          >
+                            <Download className="w-3 h-3" />
+                            <span>Download</span>
+                          </button>
+                        )}
+                      </div>
+                      
+                      {/* Error Details */}
+                      {progress.error && (
+                        <div className="mt-2 p-2 bg-red-50 border border-red-200 rounded text-sm text-red-700">
+                          {progress.error}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Modal Footer */}
+            <div className="p-6 border-t border-gray-200 bg-gray-50">
+              <div className="flex justify-between items-center">
+                <div className="text-sm text-gray-600">
+                  {Object.values(bulkDownloadProgress).filter(p => p.status === 'ready').length > 0 && (
+                    <span>
+                      {Object.values(bulkDownloadProgress).filter(p => p.status === 'ready').length} video{Object.values(bulkDownloadProgress).filter(p => p.status === 'ready').length > 1 ? 's' : ''} ready to download
+                    </span>
+                  )}
+                </div>
+                
+                <div className="flex space-x-3">
+                  {Object.values(bulkDownloadProgress).filter(p => p.status === 'ready').length > 0 && (
+                    <button
+                      onClick={handleDownloadAll}
+                      className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors font-medium"
+                    >
+                      Download All Ready ({Object.values(bulkDownloadProgress).filter(p => p.status === 'ready').length})
+                    </button>
+                  )}
+                  
+                  <button
+                    onClick={closeBulkDownload}
+                    className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition-colors"
+                  >
+                    Close
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Confirmation Modal */}
+      {showDeleteConfirmation && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-xl shadow-2xl max-w-md w-full">
+            {/* Modal Header */}
+            <div className="flex items-center justify-between p-6 border-b border-gray-200">
+              <div className="flex items-center space-x-3">
+                <div className="w-10 h-10 bg-red-100 rounded-lg flex items-center justify-center">
+                  <Trash2 className="w-5 h-5 text-red-600" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-semibold text-gray-900">Confirm Bulk Delete</h3>
+                  <p className="text-sm text-gray-500">
+                    This action cannot be undone
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowDeleteConfirmation(false)}
+                className="p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Modal Content */}
+            <div className="p-6">
+              <div className="space-y-4">
+                <div className="flex items-center space-x-3 p-4 bg-red-50 border border-red-200 rounded-lg">
+                  <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0" />
+                  <div>
+                    <p className="text-sm font-medium text-red-800">
+                      Are you sure you want to delete {selectedVideos.size} video{selectedVideos.size > 1 ? 's' : ''}?
+                    </p>
+                    <p className="text-xs text-red-600 mt-1">
+                      This will permanently delete the selected videos from Cloudflare Stream.
+                    </p>
+                  </div>
+                </div>
+
+                {/* Video list */}
+                <div className="max-h-48 overflow-y-auto">
+                  <div className="space-y-2">
+                    {Array.from(selectedVideos).map(videoId => {
+                      const video = videos.find(v => v.uid === videoId);
+                      return (
+                        <div key={videoId} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
+                          <div className="flex items-center space-x-3">
+                            {video?.thumbnail ? (
+                              <img
+                                src={video.thumbnail}
+                                alt={video.filename}
+                                className="w-10 h-6 object-cover rounded"
+                              />
+                            ) : (
+                              <div className="w-10 h-6 bg-gray-300 rounded flex items-center justify-center">
+                                <Play className="w-3 h-3 text-gray-500" />
+                              </div>
+                            )}
+                            <div>
+                              <p className="text-sm font-medium text-gray-900 truncate max-w-48">
+                                {video?.meta?.name || video?.filename || 'Untitled Video'}
+                              </p>
+                              <p className="text-xs text-gray-500">{videoId}</p>
+                            </div>
+                          </div>
+                          <Trash2 className="w-4 h-4 text-red-500" />
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Modal Footer */}
+            <div className="p-6 border-t border-gray-200 bg-gray-50">
+              <div className="flex justify-end space-x-3">
+                <button
+                  onClick={() => setShowDeleteConfirmation(false)}
+                  className="px-4 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleBulkDeleteConfirm}
+                  className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors font-medium"
+                >
+                  Delete {selectedVideos.size} Video{selectedVideos.size > 1 ? 's' : ''}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bulk Delete Progress Modal */}
+      {bulkDeleteActive && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-hidden">
+            {/* Modal Header */}
+            <div className="flex items-center justify-between p-6 border-b border-gray-200">
+              <div className="flex items-center space-x-3">
+                <div className="w-10 h-10 bg-red-100 rounded-lg flex items-center justify-center">
+                  <Trash2 className="w-5 h-5 text-red-600" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-semibold text-gray-900">Bulk Delete Progress</h3>
+                  <p className="text-sm text-gray-500">
+                    Deleting {Object.keys(bulkDeleteProgress).length} videos
+                  </p>
+                </div>
+              </div>
+              
+              {/* Progress Summary */}
+              <div className="text-right">
+                <div className="text-sm font-medium text-gray-900">
+                  {Object.values(bulkDeleteProgress).filter(p => p.status === 'deleted').length} / {Object.keys(bulkDeleteProgress).length} Deleted
+                </div>
+                <div className="text-xs text-gray-500">
+                  {Object.values(bulkDeleteProgress).filter(p => p.status === 'error').length} Errors
+                </div>
+              </div>
+            </div>
+
+            {/* Modal Content */}
+            <div className="p-6 max-h-96 overflow-y-auto">
+              <div className="space-y-4">
+                {Object.entries(bulkDeleteProgress).map(([videoId, progress]) => {
+                  const video = videos.find(v => v.uid === videoId);
+                  const videoName = video?.meta?.name || video?.filename || 'Untitled Video';
+                  
+                  return (
+                    <div key={videoId} className="border border-gray-200 rounded-lg p-4">
+                      <div className="flex items-center justify-between mb-2">
+                        <h4 className="font-medium text-gray-900 truncate flex-1 mr-4">
+                          {videoName}
+                        </h4>
+                        <div className="flex items-center space-x-2">
+                          {progress.status === 'pending' && (
+                            <Clock className="w-4 h-4 text-gray-400" />
+                          )}
+                          {progress.status === 'deleting' && (
+                            <div className="w-4 h-4 border-2 border-red-500 border-t-transparent rounded-full animate-spin" />
+                          )}
+                          {progress.status === 'deleted' && (
+                            <CheckCircle className="w-4 h-4 text-green-500" />
+                          )}
+                          {progress.status === 'error' && (
+                            <AlertCircle className="w-4 h-4 text-red-500" />
+                          )}
+                        </div>
+                      </div>
+                      
+                      {/* Status Message */}
+                      <p className={`text-sm ${
+                        progress.status === 'error' ? 'text-red-600' : 
+                        progress.status === 'deleted' ? 'text-green-600' : 'text-gray-600'
+                      }`}>
+                        {progress.message}
+                      </p>
+                      
+                      {/* Error Details */}
+                      {progress.error && (
+                        <div className="mt-2 p-2 bg-red-50 border border-red-200 rounded text-sm text-red-700">
+                          {progress.error}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Modal Footer */}
+            <div className="p-6 border-t border-gray-200 bg-gray-50">
+              <div className="flex justify-between items-center">
+                <div className="text-sm text-gray-600">
+                  {Object.values(bulkDeleteProgress).filter(p => p.status === 'deleted').length} of {Object.keys(bulkDeleteProgress).length} videos deleted
+                  {Object.values(bulkDeleteProgress).filter(p => p.status === 'error').length > 0 && (
+                    <span className="text-red-600 ml-2">
+                      ({Object.values(bulkDeleteProgress).filter(p => p.status === 'error').length} failed)
+                    </span>
+                  )}
+                </div>
+                
+                <div className="flex space-x-3">
+                  {Object.values(bulkDeleteProgress).every(p => p.status === 'deleted' || p.status === 'error') && (
+                    <button
+                      onClick={closeBulkDelete}
+                      className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition-colors"
+                    >
+                      Close
+                    </button>
                   )}
                 </div>
               </div>

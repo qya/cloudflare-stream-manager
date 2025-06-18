@@ -23,6 +23,34 @@ function App() {
   const [isOnline, setIsOnline] = useState(navigator.onLine);
 
   // Electron API is ready
+  useEffect(() => {
+    // Set up IPC listeners for menu navigation
+    if (window.electron) {
+      window.electron.ipcRenderer.on('navigate-to', (tab: string) => {
+        setActiveTab(tab);
+      });
+
+      window.electron.ipcRenderer.on('refresh-data', () => {
+        setRefreshTrigger(prev => prev + 1);
+      });
+
+      window.electron.ipcRenderer.on('file-selected', (filePath: string) => {
+        setActiveTab('upload');
+        // You could pass the file path to the upload component here if needed
+      });
+    }
+
+    return () => {
+      // Clean up listeners if needed
+    };
+  }, []);
+
+  // Notify main process when configuration state changes
+  useEffect(() => {
+    if (window.electron) {
+      window.electron.ipcRenderer.invoke('update-config-state', isConfigured);
+    }
+  }, [isConfigured]);
 
   // Load config from localStorage on startup
   useEffect(() => {

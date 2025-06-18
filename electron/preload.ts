@@ -12,13 +12,13 @@ contextBridge.exposeInMainWorld('electron', {
       }
     },
     on: (channel: string, func: (...args: any[]) => void) => {
-      const validChannels = ['main-process-message', 'file-selected'];
+      const validChannels = ['main-process-message', 'file-selected', 'navigate-to', 'refresh-data'];
       if (validChannels.includes(channel)) {
         ipcRenderer.on(channel, (event, ...args) => func(...args));
       }
     },
     invoke: (channel: string, data?: any) => {
-      const validChannels = ['select-file', 'get-app-version', 'open-external'];
+      const validChannels = ['select-file', 'get-app-version', 'open-external', 'update-config-state', 'get-config-state'];
       if (validChannels.includes(channel)) {
         return ipcRenderer.invoke(channel, data);
       }
