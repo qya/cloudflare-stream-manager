@@ -1,8 +1,11 @@
 # Cloudflare Stream Manager
 
+![Platform](preview.png)
+
 ![Version](https://img.shields.io/badge/version-0.1.5-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)
+
 
 A beautiful, modern desktop application for managing your Cloudflare Stream video content with ease. Built with React, TypeScript, and Electron.
 
